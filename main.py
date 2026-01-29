@@ -1,8 +1,7 @@
 #!/usr/bin/python3
 import json
 import requests
-
-
+import os
 def download(url: str, fileName: str):
     response = requests.get(url, stream=True)
     response.raise_for_status()
@@ -27,8 +26,8 @@ def download(url: str, fileName: str):
     print(f"\nDone Downloading {fileName}")
 
 
-
-urlRoot = "http://dl.8bitdo.com:8080/firmware/select"
+base = "http://dl.8bitdo.com:8080/"
+urlRoot = base+"firmware/select"
 
 currentValidTypes = {
     "NGC Modkit": 91,
@@ -129,5 +128,12 @@ for t in type_values:
     for fw in firmwares:
         version = fw.get("version")
         file_url = fw.get("filePathName")
+        file_name_orig = fw.get("fileName").replace(" ","_")
+        file_name = file_name_orig.replace("/","-")
+        file_date = fw.get("date")
         #print(f"Version: {version}, File: {file_url}") # for debuging
-        
+        fullURL = base+file_url
+        cwd = os.getcwd()
+        if os.path.exists(cwd+"/fw") == False:
+            os.mkdir(cwd+"/fw")
+        download(fullURL, cwd+"/fw/"+file_name+"_"+str(file_date)+".dat")
