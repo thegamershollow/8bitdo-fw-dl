@@ -89,10 +89,7 @@ currentValidTypes = {
     "8BitDo USB Apdater for PS classic": 8
 }
 
-# Deduplicate type values
-type_values = set(currentValidTypes.values())
-
-for t in type_values:
+for device_name, t in currentValidTypes.items():
     headers = {
         "Type": str(t),
         "Beta": "1"
@@ -100,40 +97,42 @@ for t in type_values:
 
     try:
         response = requests.post(urlRoot, headers=headers)
-        print(f"\nType {t}: Status {response.status_code}")
+        print(f"\n{device_name} (Type {t}): Status {response.status_code}")
     except requests.RequestException as e:
-        print(f"Request failed for Type {t}: {e}")
+        print(f"Request failed for {device_name}: {e}")
         continue
 
-    # Try parsing the JSON safely
     try:
         data = response.json()["list"]
-    except json.JSONDecodeError:
-        print("Response is not valid JSON!")
-        print(response.text)
+    except (json.JSONDecodeError, KeyError):
+        print("Invalid JSON response")
         continue
 
-    # Handle case where each item in the list is itself a JSON string
     firmwares = []
     for fw in data:
         if isinstance(fw, str):
             try:
                 fw = json.loads(fw)
             except json.JSONDecodeError:
-                #print(f"Skipping invalid JSON item: {fw}") # for debuging
                 continue
         firmwares.append(fw)
 
-    # Print firmware info
-    for fw in firmwares:
-        version = fw.get("version")
-        file_url = fw.get("filePathName")
-        file_name_orig = fw.get("fileName").replace(" ","_")
-        file_name = file_name_orig.replace("/","-")
-        file_date = fw.get("date")
-        #print(f"Version: {version}, File: {file_url}") # for debuging
-        fullURL = base+file_url
-        cwd = os.getcwd()
-        if os.path.exists(cwd+"/fw") == False:
-            os.mkdir(cwd+"/fw")
-        download(fullURL, cwd+"/fw/"+file_name+"_"+str(file_date)+".dat")
+    if not firmwares:
+        print(f"No firmware found for {device_name}")
+        continue
+
+    # Pick latest firmware by date
+    latest_fw = max(firmwares, key=lambda fw: fw.get("date", 0))
+
+    file_url = latest_fw["filePathName"]
+    file_name = latest_fw["fileName"].replace(" ", "_").replace("/", "-")
+    file_date = latest_fw["date"]
+
+    fw_dir = os.path.join(os.getcwd(), "fw", device_name)
+    os.makedirs(fw_dir, exist_ok=True)
+
+    fullURL = base + file_url
+    download(
+        fullURL,
+        os.path.join(fw_dir, f"{file_name}_{file_date}.dat")
+    )
