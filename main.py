@@ -4,6 +4,9 @@ import requests
 import os
 import sys
 import argparse
+import difflib
+import time
+from requests.exceptions import Timeout, ConnectionError, HTTPError
 
 BASE = "http://dl.8bitdo.com:8080"
 URL_ROOT = BASE + "/firmware/select"
@@ -69,6 +72,40 @@ currentValidTypes = {
 }
 
 
+# ----------------------------
+# Retry helper
+# ----------------------------
+
+def request_with_retry(method, url, *, max_retries=5, backoff=1, **kwargs):
+    for attempt in range(1, max_retries + 1):
+        try:
+            response = requests.request(method, url, **kwargs)
+
+            if response.status_code >= 500:
+                raise HTTPError(
+                    f"Server error: {response.status_code}",
+                    response=response
+                )
+
+            return response
+
+        except (Timeout, ConnectionError, HTTPError) as e:
+            if attempt == max_retries:
+                print(f"Request failed after {max_retries} attempts.")
+                raise
+
+            delay = backoff * (2 ** (attempt - 1))
+            print(
+                f"Request failed ({type(e).__name__}), "
+                f"retrying in {delay}s... [{attempt}/{max_retries}]"
+            )
+            time.sleep(delay)
+
+
+# ----------------------------
+# Argparse
+# ----------------------------
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description="8BitDo firmware downloader (non-interactive)"
@@ -82,7 +119,7 @@ def parse_args():
 
     parser.add_argument(
         "--device",
-        help="Device name (exact match from --list-devices)"
+        help="Device name (fuzzy-matched)"
     )
 
     parser.add_argument(
@@ -106,10 +143,49 @@ def parse_args():
     return parser.parse_args()
 
 
+# ----------------------------
+# Device handling
+# ----------------------------
+
 def list_devices():
     for name, t in currentValidTypes.items():
         print(f"{name} (Type {t})")
 
+
+def resolve_device(name: str):
+    keys = list(currentValidTypes.keys())
+
+    # Exact
+    if name in currentValidTypes:
+        return name, currentValidTypes[name]
+
+    # Case-insensitive
+    lower_map = {k.lower(): k for k in keys}
+    if name.lower() in lower_map:
+        k = lower_map[name.lower()]
+        return k, currentValidTypes[k]
+
+    # Partial
+    partial = [k for k in keys if name.lower() in k.lower()]
+    if len(partial) == 1:
+        k = partial[0]
+        return k, currentValidTypes[k]
+
+    # Fuzzy
+    matches = difflib.get_close_matches(name, keys, n=3, cutoff=0.6)
+    if matches:
+        print("Device not found. Did you mean:")
+        for m in matches:
+            print(f"  - {m}")
+    else:
+        print("Device not found. Use --list-devices to see valid names.")
+
+    sys.exit(1)
+
+
+# ----------------------------
+# Firmware API
+# ----------------------------
 
 def fetch_firmware(device_type):
     headers = {
@@ -117,24 +193,62 @@ def fetch_firmware(device_type):
         "Beta": "1"
     }
 
-    response = requests.post(URL_ROOT, headers=headers)
-    response.raise_for_status()
+    try:
+        response = request_with_retry(
+            "POST",
+            URL_ROOT,
+            headers=headers,
+            timeout=10
+        )
+        response.raise_for_status()
+    except Exception as e:
+        print(f"API request failed: {e}")
+        sys.exit(1)
 
-    raw = response.json()["list"]
+    try:
+        payload = response.json()
+    except json.JSONDecodeError:
+        print("API returned invalid JSON.")
+        sys.exit(1)
+
+    if "list" not in payload or not isinstance(payload["list"], list):
+        print("Unexpected API response format.")
+        sys.exit(1)
+
     firmwares = []
-
-    for fw in raw:
+    for fw in payload["list"]:
         if isinstance(fw, str):
-            fw = json.loads(fw)
-        firmwares.append(fw)
+            try:
+                fw = json.loads(fw)
+            except json.JSONDecodeError:
+                continue
+        if isinstance(fw, dict):
+            firmwares.append(fw)
+
+    if not firmwares:
+        print("Firmware list is empty.")
+        sys.exit(1)
 
     firmwares.sort(key=lambda fw: fw.get("date", 0), reverse=True)
     return firmwares
 
 
+# ----------------------------
+# Download
+# ----------------------------
+
 def download(url: str, file_name: str):
-    response = requests.get(url, stream=True)
-    response.raise_for_status()
+    try:
+        response = request_with_retry(
+            "GET",
+            url,
+            stream=True,
+            timeout=15
+        )
+        response.raise_for_status()
+    except Exception as e:
+        print(f"Download failed: {e}")
+        sys.exit(1)
 
     length = response.headers.get("content-length")
     block_size = 1_000_000
@@ -157,6 +271,10 @@ def download(url: str, file_name: str):
     print("\nDownload complete.")
 
 
+# ----------------------------
+# Main
+# ----------------------------
+
 def main():
     args = parse_args()
 
@@ -168,23 +286,14 @@ def main():
         print("Error: --device is required (unless --list-devices)")
         sys.exit(1)
 
-    if args.device not in currentValidTypes:
-        print("Unknown device. Use --list-devices to see valid names.")
-        sys.exit(1)
-
-    device_type = currentValidTypes[args.device]
+    device_name, device_type = resolve_device(args.device)
     firmwares = fetch_firmware(device_type)
-
-    if not firmwares:
-        print("No firmware found.")
-        return
 
     if args.list_firmware:
         for i, fw in enumerate(firmwares, start=1):
             print(f"{i:2}. {fw['fileName']} ({fw['date']})")
         return
 
-    # Default behavior: latest
     if args.firmware:
         index = args.firmware - 1
         if index < 0 or index >= len(firmwares):
@@ -192,9 +301,9 @@ def main():
             sys.exit(1)
         selected_fw = firmwares[index]
     else:
-        selected_fw = firmwares[0]
+        selected_fw = firmwares[0]  # latest
 
-    fw_dir = os.path.join(os.getcwd(), "fw", args.device)
+    fw_dir = os.path.join(os.getcwd(), "fw", device_name)
     os.makedirs(fw_dir, exist_ok=True)
 
     file_url = BASE + selected_fw["filePathName"]
